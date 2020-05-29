@@ -11,6 +11,23 @@ import "time"
 import "strings"
 
 //
+// main/mrworker.go calls this function.
+//
+func Worker(mapf func(string, string) []KeyValue,
+	reducef func(string, []string) string) {
+	w := worker{
+		mapf:    mapf,
+		reducef: reducef,
+	}
+
+	for {
+		task := requestTask()
+		w.doTask(&task)
+		time.Sleep(time.Millisecond * 500)
+	}
+}
+
+//
 // Map functions return a slice of KeyValue.
 //
 type KeyValue struct {
@@ -19,7 +36,6 @@ type KeyValue struct {
 }
 
 type worker struct {
-	nReduce int
 	mapf    func(string, string) []KeyValue
 	reducef func(string, []string) string
 }
@@ -42,40 +58,15 @@ func ihash(key string) int {
 	return int(h.Sum32() & 0x7fffffff)
 }
 
-func requestTask() (Task, bool) {
+func requestTask() Task {
 	reply := Task{}
 
-	if ok := call("Master.TaskRequest", EmptyReq{}, &reply); !ok {
+	if ok := call("Master.TaskRequest", &EmptyReq{}, &reply); !ok {
 		fmt.Println("Master didn't respond. Closing worker.")
 		os.Exit(0)
 	}
 
-	if reply.Id == 0 {
-		return reply, true
-	}
-
-	return reply, false
-}
-
-func readFile(filename string) string {
-	file, err := os.Open(filename)
-	if err != nil {
-		log.Fatalf("cannot open %v", filename)
-	}
-
-	content, err := ioutil.ReadAll(file)
-	if err != nil {
-		log.Fatalf("cannot read %v", filename)
-	}
-
-	file.Close()
-	return string(content)
-}
-
-func (w *worker) register() {
-	r := RegisterRep{}
-	call("Master.RegisterWorker", EmptyReq{}, &r)
-	w.nReduce = r.NReduce
+	return reply
 }
 
 func (w *worker) doTask(task *Task) {
@@ -90,36 +81,46 @@ func (w *worker) doTask(task *Task) {
 }
 
 func (w *worker) doMap(t *Task) {
-	fmt.Printf("Working on: %v", t)
+	if len(t.Filename) == 0 {
+		return
+	}
 
-	content := readFile(t.Filename)
-	// TODO: error handler
+	fmt.Printf("Working on: %v\n", t.Filename)
 
-	kva := w.mapf(t.Filename, content)
-	buckets := make([][]KeyValue, w.nReduce)
+	content, err := ioutil.ReadFile(t.Filename)
+
+	if err != nil {
+		call("Master.ReportStatus", &StatusReportReq{Failed: true}, &EmptyRep{})
+		return
+	}
+
+	kva := w.mapf(t.Filename, string(content))
+	buckets := make([][]KeyValue, t.NReduce)
 
 	for _, kv := range kva {
-		idx := ihash(kv.Key) % w.nReduce
+		idx := ihash(kv.Key) % t.NReduce
 		buckets[idx] = append(buckets[idx], kv)
 	}
 
 	for i, bucket := range buckets {
 		filename := intermediateFilename(t.Id, i)
 		f, err := os.Create(filename)
-		enc := json.NewEncoder(f)
 
 		if err != nil {
-			// TODO: error handler
+			call("Master.ReportStatus", &StatusReportReq{Failed: true}, &EmptyRep{})
+			return
 		}
+
+		enc := json.NewEncoder(f)
 
 		// for each item in bucket, encode as JSON
 		for _, kv := range bucket {
 			enc.Encode(&kv)
-			// TODO: error handler
 		}
 
 		if err := f.Close(); err != nil {
-			// TODO: error handler
+			call("Master.ReportStatus", &StatusReportReq{Failed: true}, &EmptyRep{})
+			return
 		}
 	}
 
@@ -128,19 +129,22 @@ func (w *worker) doMap(t *Task) {
 		Done: true,
 	}
 
-	call("Master.ReportStatus", status, EmptyRep{})
+	call("Master.ReportStatus", &status, &EmptyRep{})
 }
 
 func (w *worker) doReduce(t *Task) {
 	maps := make(map[string][]string)
 
+	fmt.Printf("Working on reduce: %v\n", t.Id)
+
 	for i := 0; i < t.NMaps; i++ {
 		filename := intermediateFilename(i, t.Id)
-		fmt.Printf("File: %v", filename)
 		file, err := os.Open(filename)
 
 		if err != nil {
-			// TODO: handle error
+			fmt.Println("Failed to open %v", filename)
+			call("Master.ReportStatus", &StatusReportReq{Failed: true}, &EmptyRep{})
+			return
 		}
 
 		dec := json.NewDecoder(file)
@@ -162,7 +166,7 @@ func (w *worker) doReduce(t *Task) {
 	res := make([]string, 0, 100)
 
 	for k, v := range maps {
-		res = append(res, fmt.Sprintf("%v %v\n"), k, w.reducef(k, v))
+		res = append(res, fmt.Sprintf("%v %v\n", k, w.reducef(k, v)))
 	}
 
 	filename := outputFilename(t.Id)
@@ -174,7 +178,7 @@ func (w *worker) doReduce(t *Task) {
 			Failed: true,
 		}
 
-		call("Master.ReportStatus", status, EmptyRep{})
+		call("Master.ReportStatus", &status, &EmptyRep{})
 		return
 	}
 
@@ -183,31 +187,7 @@ func (w *worker) doReduce(t *Task) {
 		Done: true,
 	}
 
-	call("Master.ReportStatus", status, EmptyRep{})
-}
-
-//
-// main/mrworker.go calls this function.
-//
-func Worker(mapf func(string, string) []KeyValue,
-	reducef func(string, []string) string) {
-
-	w := worker{
-		mapf:    mapf,
-		reducef: reducef,
-	}
-
-	w.register()
-
-	for {
-		task, empty := requestTask()
-
-		if !empty {
-			w.doTask(&task)
-		}
-
-		time.Sleep(time.Millisecond * 500)
-	}
+	call("Master.ReportStatus", &status, &EmptyRep{})
 }
 
 //

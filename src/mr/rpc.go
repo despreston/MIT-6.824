@@ -12,11 +12,6 @@ import "strconv"
 type EmptyRep struct{}
 type EmptyReq struct{}
 
-type RegisterRep struct {
-	Id      int
-	NReduce int
-}
-
 type StatusReportReq struct {
 	Task   *Task
 	Done   bool

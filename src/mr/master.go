@@ -55,6 +55,7 @@ func (m *Master) getTaskId() int {
 }
 
 func initTimeout(m *Master, task *Task) {
+	fmt.Printf("Initiating timer for %v", task)
 	time.Sleep(taskTimeout)
 
 	if m.tasksMeta[task.Id].status == taskFinished {
@@ -82,10 +83,6 @@ func (m *Master) TaskRequest(_ *EmptyReq, reply *Task) error {
 		}
 	}
 
-	if task.Id == 0 {
-		return nil
-	}
-
 	m.tasksMeta[task.Id].status = taskRunning
 
 	reply.Id = task.Id
@@ -94,10 +91,7 @@ func (m *Master) TaskRequest(_ *EmptyReq, reply *Task) error {
 	reply.NReduce = task.NReduce
 	reply.Phase = task.Phase
 
-	go initTimeout(m, reply)
-
-	fmt.Printf("Assigning task to worker: %v\n", reply.Id)
-
+	go initTimeout(m, &task)
 	return nil
 }
 
@@ -116,7 +110,7 @@ func (m *Master) ReportStatus(req *StatusReportReq, _ *EmptyRep) error {
 
 	allFinished := true
 	for _, v := range m.tasksMeta {
-		if v.taskId != 0 && v.status != taskFinished {
+		if v.status != taskFinished {
 			allFinished = false
 			break
 		}
@@ -134,17 +128,6 @@ func (m *Master) ReportStatus(req *StatusReportReq, _ *EmptyRep) error {
 			os.Exit(0)
 		}
 	}
-
-	return nil
-}
-
-func (m *Master) RegisterWorker(_ *EmptyReq, reply *RegisterRep) error {
-	m.mux.Lock()
-	defer m.mux.Unlock()
-
-	reply.NReduce = m.nReduce
-
-	fmt.Printf("Registering worker\n")
 
 	return nil
 }
@@ -169,8 +152,20 @@ func (m *Master) server() {
 // main/mrmaster.go calls Done() periodically to find out
 // if the entire job has finished.
 //
+// The job is done when there are no queue'd or running tasks, and the phase is
+// 'ReducePhase'
+//
 func (m *Master) Done() bool {
-	return len(m.files) == 0
+	queuedOrRunningTasksExist := false
+
+	for _, v := range m.tasksMeta {
+		if v.status == taskQueued || v.status == taskRunning {
+			queuedOrRunningTasksExist = true
+			break
+		}
+	}
+
+	return m.phase == ReducePhase && !queuedOrRunningTasksExist
 }
 
 func (m *Master) enqueueReduceTasks() {
